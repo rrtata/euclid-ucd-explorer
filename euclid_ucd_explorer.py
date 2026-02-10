@@ -393,6 +393,152 @@ def fetch_2d_grism_from_s3(tileid, combspec_file):
         return None
 
 
+def auto_fetch_spectra(object_id):
+    """
+    Auto-fetch spectral data for an object: queries IRSA, downloads COMBSPEC,
+    extracts 1D spectrum + returns FITS HDU list for 2D display.
+
+    Returns dict cached in session state:
+    {
+        'spectrum':  {'wave':..., 'flux':..., 'noise':..., 'wave_um':...} or None,
+        'hdul_bytes': bytes of the COMBSPEC FITS file (for 2D),
+        'hdu_idx':   int HDU index for this object,
+        'tileid':    str,
+        'combspec':  str filename,
+        'status':    'ok' | 'no_association' | 'download_failed' | 'no_spectrum',
+        'error':     str or None,
+    }
+    """
+    import re
+    from astropy.io import fits
+
+    cache_key = f"spectra_cache_{object_id}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    result = {'spectrum': None, 'hdul_bytes': None, 'hdu_idx': 1,
+              'tileid': '', 'combspec': '', 'status': 'pending', 'error': None}
+
+    # Step 1: Query IRSA for spectral association
+    assoc = query_spectral_association(object_id)
+    if assoc is None:
+        result['status'] = 'no_association'
+        st.session_state[cache_key] = result
+        return result
+
+    uri = assoc.get('uri', '')
+    result['tileid'] = str(assoc.get('tileid', ''))
+    result['hdu_idx'] = int(assoc.get('hdu', 1))
+
+    match = re.search(r'(EUC_SIR_W-COMBSPEC_\d+_[^?]+\.fits)', uri)
+    if not match or not result['tileid']:
+        result['status'] = 'no_association'
+        result['error'] = f"Could not parse COMBSPEC from URI: {uri[:100]}"
+        st.session_state[cache_key] = result
+        return result
+
+    result['combspec'] = match.group(1)
+
+    # Step 2: Download COMBSPEC from S3
+    s3 = get_s3_client()
+    if s3 is None:
+        result['status'] = 'download_failed'
+        result['error'] = 'boto3 not available'
+        st.session_state[cache_key] = result
+        return result
+
+    s3_key = f"q1/SIR/{result['tileid']}/{result['combspec']}"
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        raw_bytes = response['Body'].read()
+        result['hdul_bytes'] = raw_bytes
+    except Exception as e:
+        result['status'] = 'download_failed'
+        result['error'] = str(e)
+        st.session_state[cache_key] = result
+        return result
+
+    # Step 3: Extract 1D spectrum from the correct HDU
+    try:
+        hdul = fits.open(io.BytesIO(raw_bytes))
+        hdu_idx = result['hdu_idx']
+
+        if hdu_idx < len(hdul):
+            ext = hdul[hdu_idx]
+            tbl = ext.data
+            hdr = ext.header
+
+            if tbl is not None and hasattr(tbl, 'dtype') and tbl.dtype.names:
+                colnames = [c.upper() for c in tbl.dtype.names]
+
+                # Wavelength
+                wave = None
+                for wn in ['WAVELENGTH', 'WAVE', 'LAMBDA']:
+                    if wn in colnames:
+                        wave = np.array(tbl[wn], dtype=float)
+                        break
+
+                # Signal
+                flux_raw = None
+                for fn in ['SIGNAL', 'FLUX', 'DATA']:
+                    if fn in colnames:
+                        flux_raw = np.array(tbl[fn], dtype=float)
+                        break
+
+                if wave is not None and flux_raw is not None:
+                    # FSCALE
+                    fscale = hdr.get('FSCALE', None)
+                    if fscale is None or fscale == 0:
+                        try:
+                            fscale = hdul[0].header.get('FSCALE', 1.0)
+                        except Exception:
+                            fscale = 1.0
+                    if fscale == 0:
+                        fscale = 1.0
+                    flux = flux_raw * fscale
+
+                    # Noise
+                    if 'VAR' in colnames:
+                        var = np.array(tbl['VAR'], dtype=float)
+                        noise = np.sqrt(np.abs(var)) * abs(fscale)
+                    else:
+                        noise = np.abs(flux) * 0.1
+
+                    # Mask
+                    bad_mask = np.zeros(len(wave), dtype=bool)
+                    if 'MASK' in colnames:
+                        mask_vals = np.array(tbl['MASK'], dtype=int)
+                        bad_mask = (mask_vals % 2 == 1) | (mask_vals >= 64)
+
+                    good = (~bad_mask & np.isfinite(wave) & np.isfinite(flux) &
+                            np.isfinite(noise) & (noise > 0) & (wave > 0))
+
+                    if good.sum() >= 20:
+                        w, f, n = wave[good], flux[good], noise[good]
+                        # Wavelength unit conversion
+                        med_w = np.nanmedian(w)
+                        if med_w > 5000:
+                            wave_um = w / 10000.0
+                        elif med_w > 500:
+                            wave_um = w / 1000.0
+                        else:
+                            wave_um = w
+                        wave_ang = wave_um * 10000.0
+
+                        result['spectrum'] = {
+                            'wave': wave_ang, 'flux': f, 'noise': n,
+                            'wave_um': wave_um
+                        }
+
+        hdul.close()
+    except Exception as e:
+        result['error'] = f"Spectrum extraction: {e}"
+
+    result['status'] = 'ok' if result['spectrum'] else 'no_spectrum'
+    st.session_state[cache_key] = result
+    return result
+
+
 # =====================================================================
 # SPECTRAL FITTING ENGINE
 # =====================================================================
@@ -1177,6 +1323,9 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
     # Three-column layout
     info_col, spec_col = st.columns([1, 2])
 
+    # Will be populated by spec_col if S3 fetch occurs
+    s3_data = None
+
     with info_col:
         st.markdown("#### 📋 Properties")
 
@@ -1217,10 +1366,12 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                     unsafe_allow_html=True)
 
     with spec_col:
-        # --- SPECTRUM ---
-        st.markdown("#### 📈 NISP Spectrum & Template Fit")
+        # =============================================================
+        # AUTO-FETCH SPECTRUM FROM S3 (on object selection)
+        # =============================================================
+        st.markdown("#### 📈 NISP Spectrum")
 
-        # Check for pre-extracted spectrum
+        # Check for pre-extracted local spectrum first
         spectrum = None
         oid_str = str(oid)
         for key in [oid_str, str(int(float(oid_str))) if oid_str.replace('-','').replace('.','').isdigit() else '']:
@@ -1228,12 +1379,54 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                 spectrum = local_spectra[key]
                 break
 
+        # If no local spectrum, auto-fetch from S3
+        s3_data = None
+        if spectrum is None:
+            with st.spinner(f"🌐 Querying IRSA + downloading spectrum for {oid}..."):
+                s3_data = auto_fetch_spectra(oid)
+
+            if s3_data['status'] == 'ok' and s3_data['spectrum']:
+                spectrum = s3_data['spectrum']
+                st.success(f"✅ Spectrum from tile {s3_data['tileid']} "
+                           f"(HDU {s3_data['hdu_idx']})")
+            elif s3_data['status'] == 'no_association':
+                st.info("ℹ️ No NISP spectrum available for this object")
+            elif s3_data['status'] == 'download_failed':
+                st.error(f"❌ S3 download failed: {s3_data.get('error', 'unknown')}")
+            elif s3_data['status'] == 'no_spectrum':
+                st.warning("⚠️ COMBSPEC downloaded but no valid 1D data in HDU")
+            # Clear cache button
+            cache_key = f"spectra_cache_{oid}"
+            if cache_key in st.session_state:
+                if st.button("🔄 Re-fetch spectrum", key=f"refetch_{oid}"):
+                    del st.session_state[cache_key]
+                    st.rerun()
+
+        # --- Display 1D spectrum ---
         if spectrum is not None:
-            # --- LIVE FITTING ---
+            fig_raw, ax = plt.subplots(1, 1, figsize=(10, 4))
+            w = spectrum.get('wave_um', spectrum['wave'] / 10000.0)
+            ax.fill_between(w, spectrum['flux'] - spectrum['noise'],
+                            spectrum['flux'] + spectrum['noise'],
+                            alpha=0.3, color='steelblue', label='±1σ')
+            ax.plot(w, spectrum['flux'], 'k-', lw=0.8, label='Flux')
+            ax.set_xlabel('Wavelength (μm)', fontsize=11)
+            ax.set_ylabel('Flux (calibrated)', fontsize=11)
+            ax.set_title(f'1D NISP Spectrum — {oid}', fontsize=12, fontweight='bold')
+            ax.set_xlim(1.1, 2.0)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_raw)
+            plt.close(fig_raw)
+
+            # --- TEMPLATE FITTING ---
             if standards is not None:
+                st.markdown("---")
+                st.markdown("#### 🔬 Template Fitting")
                 try_binary = st.checkbox("Try binary composites", value=True,
                                          key=f"bin_{oid}")
-                fit_button = st.button("🔬 Run Template Fit", key=f"fit_{oid}")
+                fit_button = st.button("Run Template Fit", key=f"fit_{oid}")
 
                 if fit_button:
                     progress_bar = st.progress(0)
@@ -1244,7 +1437,6 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                             progress_callback=lambda p: progress_bar.progress(p))
 
                     if results:
-                        # Show results
                         best = results[0]
                         if best['chi2_red'] < 5:
                             st.success(f"✅ Best fit: **{best['spt']}** "
@@ -1256,7 +1448,6 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                             st.error(f"❌ Poor fit: {best['spt']} "
                                      f"(χ²ᵥ = {best['chi2_red']:.1f})")
 
-                        # Top 5 table
                         top_df = pd.DataFrame([{
                             'Rank': i+1,
                             'SpT': r['spt'],
@@ -1265,101 +1456,36 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                         } for i, r in enumerate(results[:5])])
                         st.dataframe(top_df, hide_index=True)
 
-                        # Plot
                         fig_spec = plot_spectral_fit(spectrum, results)
                         st.pyplot(fig_spec)
                         plt.close(fig_spec)
                     else:
                         st.error("Spectrum failed quality check (noise-dominated)")
                     progress_bar.empty()
-                else:
-                    # Just show the raw spectrum
-                    fig_raw, ax = plt.subplots(1, 1, figsize=(10, 4))
-                    w = spectrum['wave'] / 10000.0
-                    ax.fill_between(w, spectrum['flux'] - spectrum['noise'],
-                                    spectrum['flux'] + spectrum['noise'],
-                                    alpha=0.3, color='gray')
-                    ax.plot(w, spectrum['flux'], 'k-', lw=0.8)
-                    ax.set_xlabel('Wavelength (μm)')
-                    ax.set_ylabel('Flux')
-                    ax.set_title(f'NISP Spectrum — {oid}')
-                    ax.set_xlim(1.2, 1.9)
-                    st.pyplot(fig_raw)
-                    plt.close(fig_raw)
-            else:
-                # No standards — just plot raw
-                fig_raw, ax = plt.subplots(1, 1, figsize=(10, 4))
-                w = spectrum['wave'] / 10000.0
-                ax.plot(w, spectrum['flux'], 'k-', lw=0.8)
-                ax.set_xlabel('Wavelength (μm)')
-                ax.set_ylabel('Flux')
-                ax.set_title(f'NISP Spectrum — {oid}')
-                st.pyplot(fig_raw)
-                plt.close(fig_raw)
-        else:
-            st.info("No pre-extracted spectrum. Click below to query S3.")
 
-            if st.button("🌐 Fetch from S3/IRSA", key=f"fetch_{oid}"):
-                with st.spinner("Querying IRSA for spectral association..."):
-                    assoc = query_spectral_association(oid)
-                    if assoc is not None:
-                        st.write(f"Found: tile={assoc.get('tileid')}, "
-                                 f"HDU={assoc.get('hdu')}")
-                        # Parse COMBSPEC file from URI
-                        uri = assoc.get('uri', '')
-                        import re
-                        match = re.search(
-                            r'(EUC_SIR_W-COMBSPEC_\d+_[^?]+\.fits)', uri)
-                        if match:
-                            cfile = match.group(1)
-                            tileid = assoc.get('tileid', '')
-                            hdu_idx = int(assoc.get('hdu', 1))
-                            with st.spinner(f"Downloading {cfile}..."):
-                                spectrum = fetch_spectrum_from_s3(
-                                    oid, tileid, cfile, hdu_idx)
-                            if spectrum:
-                                st.success("Spectrum downloaded!")
-                                # Store and trigger rerun
-                                local_spectra[str(oid)] = spectrum
-                                st.rerun()
-                        else:
-                            st.warning("Could not parse COMBSPEC path from URI")
-                    else:
-                        st.warning("No spectral association found in IRSA")
-
-    # --- 2D Grism Display ---
+    # =================================================================
+    # 2D GRISM SPECTROGRAM (auto-displayed if COMBSPEC was downloaded)
+    # =================================================================
     st.markdown("---")
-    show_2d = st.checkbox("📸 Show 2D grism spectrogram", value=False,
-                           key=f"2d_{oid}")
+    st.markdown("#### 📸 2D Grism Spectrogram")
 
-    if show_2d:
-        st.markdown("#### 2D Grism Image")
-
-        if st.button("Fetch 2D grism from S3", key=f"fetch2d_{oid}"):
-            with st.spinner("Querying IRSA + downloading grism frame..."):
-                assoc = query_spectral_association(oid)
-                if assoc is not None:
-                    uri = assoc.get('uri', '')
-                    import re
-                    match = re.search(
-                        r'(EUC_SIR_W-COMBSPEC_\d+_[^?]+\.fits)', uri)
-                    tileid = assoc.get('tileid', '')
-                    hdu_idx = int(assoc.get('hdu', 1))
-
-                    if match and tileid:
-                        cfile = match.group(1)
-                        hdul = fetch_2d_grism_from_s3(tileid, cfile)
-                        if hdul is not None:
-                            fig_2d = plot_2d_grism(hdul, hdu_idx, oid)
-                            st.pyplot(fig_2d)
-                            plt.close(fig_2d)
-                            hdul.close()
-                        else:
-                            st.warning("Could not fetch 2D grism data")
-                    else:
-                        st.warning("No tile/file info available")
-                else:
-                    st.warning("No spectral association found")
+    if s3_data and s3_data.get('hdul_bytes'):
+        from astropy.io import fits as afits
+        try:
+            hdul = afits.open(io.BytesIO(s3_data['hdul_bytes']))
+            hdu_idx = s3_data['hdu_idx']
+            fig_2d = plot_2d_grism(hdul, hdu_idx, oid)
+            st.pyplot(fig_2d)
+            plt.close(fig_2d)
+            hdul.close()
+        except Exception as e:
+            st.warning(f"Could not render 2D grism: {e}")
+    elif spectrum is not None and oid_str in local_spectra:
+        st.info("2D grism not available for locally pre-extracted spectra")
+    elif s3_data and s3_data['status'] == 'no_association':
+        st.info("No grism data — object has no NISP spectral association")
+    else:
+        st.info("No 2D grism data available")
 
 
 def generate_demo_catalog():
