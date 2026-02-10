@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+*.fits
+*.csv
+!requirements.txt
+bd_discovery_20260208/
+full_q1_results/
+spectra_cache/
+ml_model/
+t_sd_recovery/
+crossmatch_results/
+.env
+.DS_Store
