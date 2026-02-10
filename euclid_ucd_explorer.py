@@ -57,7 +57,7 @@ DEFAULT_MODEL_CFG  = "ml_model_v2/model_config.json"
 S3_BUCKET   = "nasa-irsa-euclid-q1"
 S3_REGION   = "us-east-1"
 
-APP_VERSION = "1.2.0"  # bump this on each push to verify deployment
+APP_VERSION = "1.2.1"  # bump this on each push to verify deployment
 
 # IRSA base URL
 IRSA_BASE   = "https://irsa.ipac.caltech.edu"
@@ -1002,19 +1002,58 @@ def plot_2d_grism(hdul, hdu_idx, object_id):
 # =====================================================================
 def query_spectral_association(object_id):
     """Query IRSA TAP for spectral file association."""
+    # Handle float64 IDs (pandas stores big ints as float)
+    oid_int = int(float(object_id))
+    q = f"""SELECT objectid, uri, tileid, hdu
+            FROM euclid.objectid_spectrafile_association_q1
+            WHERE objectid = {oid_int}"""
+
+    # Try method 1: astroquery Irsa
     try:
         from astroquery.ipac.irsa import Irsa
-        # Handle float64 IDs (pandas stores big ints as float)
-        oid_int = int(float(object_id))
-        q = f"""SELECT objectid, uri, tileid, hdu
-                FROM euclid.objectid_spectrafile_association_q1
-                WHERE objectid = {oid_int}"""
-        result = Irsa.query_tap(q, timeout=60).to_table().to_pandas()
+        result = Irsa.query_tap(q).to_table().to_pandas()
         result.columns = [c.lower() for c in result.columns]
         if len(result) > 0:
             return result.iloc[0]
+    except TypeError:
+        pass  # API mismatch, try fallback
+    except Exception as e:
+        st.caption(f"Irsa.query_tap: {e}")
+
+    # Try method 2: pyvo TAP service directly
+    try:
+        import pyvo
+        tap = pyvo.dal.TAPService("https://irsa.ipac.caltech.edu/TAP")
+        result = tap.run_sync(q).to_table().to_pandas()
+        result.columns = [c.lower() for c in result.columns]
+        if len(result) > 0:
+            return result.iloc[0]
+    except ImportError:
+        pass  # pyvo not installed
+    except Exception as e:
+        st.caption(f"pyvo TAP: {e}")
+
+    # Try method 3: raw HTTP TAP query
+    try:
+        import urllib.request, urllib.parse
+        tap_url = "https://irsa.ipac.caltech.edu/TAP/sync"
+        params = urllib.parse.urlencode({
+            'REQUEST': 'doQuery',
+            'LANG': 'ADQL',
+            'QUERY': q,
+            'FORMAT': 'json'
+        })
+        req = urllib.request.Request(f"{tap_url}?{params}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            import json as jmod
+            data = jmod.loads(resp.read().decode())
+            cols = [c['name'].lower() for c in data['metadata']]
+            if data.get('data') and len(data['data']) > 0:
+                row = dict(zip(cols, data['data'][0]))
+                return pd.Series(row)
     except Exception as e:
         st.warning(f"IRSA TAP query failed: {e}")
+
     return None
 
 
@@ -1397,15 +1436,16 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
     s3_data = None
     if spectrum is None:
         status_box = st.empty()
-        status_box.info("🌐 Step 1/3: Querying IRSA for spectral association...")
+        status_box.info("🌐 Querying IRSA TAP for spectral association...")
 
         s3_data = auto_fetch_spectra(oid)
 
         if s3_data['status'] == 'ok' and s3_data['spectrum']:
             spectrum = s3_data['spectrum']
             status_box.success(
-                f"✅ Spectrum retrieved from S3 — tile `{s3_data['tileid']}`, "
-                f"HDU {s3_data['hdu_idx']}, file `{s3_data['combspec']}`")
+                f"✅ Spectrum retrieved! Tile `{s3_data['tileid']}`, "
+                f"HDU {s3_data['hdu_idx']}, "
+                f"`{s3_data['combspec'][:60]}...`")
         elif s3_data['status'] == 'no_association':
             status_box.info(
                 "ℹ️ No NISP spectrum for this object (not in spectral footprint)")
