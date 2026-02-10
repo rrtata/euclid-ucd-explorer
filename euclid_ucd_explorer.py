@@ -57,6 +57,8 @@ DEFAULT_MODEL_CFG  = "ml_model_v2/model_config.json"
 S3_BUCKET   = "nasa-irsa-euclid-q1"
 S3_REGION   = "us-east-1"
 
+APP_VERSION = "1.2.0"  # bump this on each push to verify deployment
+
 # IRSA base URL
 IRSA_BASE   = "https://irsa.ipac.caltech.edu"
 IRSA_CUTOUT = f"{IRSA_BASE}/cgi-bin/2MASS/IM/nph-im_sia"
@@ -801,7 +803,7 @@ def make_color_color_plot(df, x_col, y_col, class_col='predicted_class',
                 opacity=0.6,
                 line=dict(width=0),
             ),
-            customdata=subset.index.values,
+            customdata=[[idx] for idx in subset.index.values],
             text=[f"ID: {row.get('object_id', idx)}<br>"
                   f"Class: {cls}<br>"
                   f"SpT: {row.get('predicted_spt', 'N/A')}<br>"
@@ -1002,15 +1004,17 @@ def query_spectral_association(object_id):
     """Query IRSA TAP for spectral file association."""
     try:
         from astroquery.ipac.irsa import Irsa
+        # Handle float64 IDs (pandas stores big ints as float)
+        oid_int = int(float(object_id))
         q = f"""SELECT objectid, uri, tileid, hdu
                 FROM euclid.objectid_spectrafile_association_q1
-                WHERE objectid = {int(object_id)}"""
+                WHERE objectid = {oid_int}"""
         result = Irsa.query_tap(q, timeout=60).to_table().to_pandas()
         result.columns = [c.lower() for c in result.columns]
         if len(result) > 0:
             return result.iloc[0]
     except Exception as e:
-        st.warning(f"IRSA query failed: {e}")
+        st.warning(f"IRSA TAP query failed: {e}")
     return None
 
 
@@ -1020,7 +1024,7 @@ def query_spectral_association(object_id):
 def main():
     # --- Header ---
     st.title("🔭 Euclid Q1 UCD Explorer")
-    st.caption("Interactive exploration of the machine-learning UCD catalog  •  "
+    st.caption(f"v{APP_VERSION}  •  Interactive exploration of the ML UCD catalog  •  "
                "Tata, Domínguez-Tagle, Martín, Žerjal & Mohandasan (2026)")
 
     # --- Sidebar: Configuration ---
@@ -1158,10 +1162,12 @@ def main():
                               index=available_cols.index(y_default)
                               if y_default in available_cols else min(1, len(available_cols)-1))
     with col3:
+        all_classes = sorted(catalog[class_col].unique())
+        default_classes = [c for c in all_classes if 'contam' not in c.lower()]
         class_filter = st.multiselect(
             "Show classes",
-            options=sorted(catalog[class_col].unique()),
-            default=sorted(catalog[class_col].unique()))
+            options=all_classes,
+            default=default_classes)
 
     # Filter
     mask = catalog[class_col].isin(class_filter)
@@ -1212,17 +1218,27 @@ def main():
     event = st.plotly_chart(fig, width="stretch",
                             on_select="rerun", key="cc_plot")
 
-    # Handle click selection
+    # Handle click/select on plot
     try:
-        if event and hasattr(event, 'selection') and event.selection:
-            pts = getattr(event.selection, 'points', [])
+        if event and event.selection:
+            pts = event.selection.get("points", event.selection.points
+                                      if hasattr(event.selection, 'points') else [])
             if pts:
                 pt = pts[0]
-                cd = pt.get('customdata', []) if isinstance(pt, dict) else getattr(pt, 'customdata', [])
-                if cd and len(cd) > 0:
-                    st.session_state.selected_idx = cd[0] if isinstance(cd, list) else cd
-    except Exception:
-        pass
+                # customdata can be: int, [int], or nested
+                cd = None
+                if isinstance(pt, dict):
+                    cd = pt.get('customdata', None)
+                else:
+                    cd = getattr(pt, 'customdata', None)
+
+                if cd is not None:
+                    idx_val = cd[0] if isinstance(cd, (list, tuple, np.ndarray)) else cd
+                    if idx_val != st.session_state.get('selected_idx'):
+                        st.session_state.selected_idx = idx_val
+                        st.rerun()
+    except Exception as e:
+        st.caption(f"⚠️ Click handler: {e}")
 
     # --- Side Panel: Selected Object Details ---
     st.markdown("---")
@@ -1320,121 +1336,128 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                       key=f"spt_override_{oid}",
                       placeholder="e.g. L3, T2+L8")
 
-    # Three-column layout
-    info_col, spec_col = st.columns([1, 2])
+    # =================================================================
+    # PROPERTIES (compact)
+    # =================================================================
+    st.markdown("---")
+    st.markdown("#### 📋 Properties")
 
-    # Will be populated by spec_col if S3 fetch occurs
+    # Build property table as columns for compact display
+    prop_cols = st.columns(5)
+    prop_items = [
+        (col_map.get('class', 'predicted_class'), 'RF Class'),
+        (col_map.get('spt', 'predicted_spt'), 'Phot SpT'),
+        (col_map.get('mag_j', 'mag_j'), 'J mag'),
+        ('y_j_color', 'Y−J'),
+        ('j_h_color', 'J−H'),
+        ('ie_ye_color', 'IE−YE'),
+        ('has_vis', 'VIS?'),
+        ('prob_ucd', 'P(UCD)'),
+        ('ra', 'RA'),
+        ('dec', 'Dec'),
+    ]
+    col_idx = 0
+    for key, label in prop_items:
+        if key in obj.index:
+            val = obj[key]
+            if isinstance(val, float) and not np.isnan(val):
+                disp = f"{val:.4f}" if label in ['RA', 'Dec'] else f"{val:.3f}"
+            else:
+                disp = str(val)
+            prop_cols[col_idx % 5].markdown(f"**{label}:** `{disp}`")
+            col_idx += 1
+
+    # VIS dropout warning
+    if obj.get('has_vis', 1) == 0:
+        st.warning("⚠️ VIS dropout — potential T dwarf or artifact")
+
+    # Class badge
+    cls = obj.get(col_map.get('class', 'predicted_class'), 'unknown')
+    color = CLASS_COLORS.get(cls, '#777')
+    st.markdown(f'<span style="background:{color};color:white;'
+                f'padding:4px 12px;border-radius:12px;font-weight:bold">'
+                f'{cls.replace("_", " ")}</span>',
+                unsafe_allow_html=True)
+
+    # =================================================================
+    # 1D SPECTRUM (auto-fetched from S3)
+    # =================================================================
+    st.markdown("---")
+    st.markdown("#### 📈 NISP 1D Spectrum")
+
+    # Check for pre-extracted local spectrum first
+    spectrum = None
+    for key in [oid_str, str(int(float(oid_str))) if oid_str.replace('-','').replace('.','').isdigit() else '']:
+        if key in local_spectra:
+            spectrum = local_spectra[key]
+            st.info("📁 Using locally pre-extracted spectrum")
+            break
+
+    # If no local spectrum, auto-fetch from S3
     s3_data = None
+    if spectrum is None:
+        status_box = st.empty()
+        status_box.info("🌐 Step 1/3: Querying IRSA for spectral association...")
 
-    with info_col:
-        st.markdown("#### 📋 Properties")
+        s3_data = auto_fetch_spectra(oid)
 
-        # Build property table
-        props = {}
-        for key, label in [
-            (col_map.get('class', 'predicted_class'), 'RF Class'),
-            (col_map.get('spt', 'predicted_spt'), 'Photometric SpT'),
-            (col_map.get('mag_j', 'mag_j'), 'J mag'),
-            ('y_j_color', 'Y−J color'),
-            ('j_h_color', 'J−H color'),
-            ('ie_ye_color', 'I_E−Y_E color'),
-            ('has_vis', 'VIS detected'),
-            ('prob_ucd', 'P(UCD)'),
-            ('ra', 'RA'),
-            ('dec', 'Dec'),
-        ]:
-            if key in obj.index:
-                val = obj[key]
-                if isinstance(val, float) and not np.isnan(val):
-                    props[label] = f"{val:.4f}" if label in ['RA', 'Dec'] else f"{val:.3f}"
-                else:
-                    props[label] = str(val)
+        if s3_data['status'] == 'ok' and s3_data['spectrum']:
+            spectrum = s3_data['spectrum']
+            status_box.success(
+                f"✅ Spectrum retrieved from S3 — tile `{s3_data['tileid']}`, "
+                f"HDU {s3_data['hdu_idx']}, file `{s3_data['combspec']}`")
+        elif s3_data['status'] == 'no_association':
+            status_box.info(
+                "ℹ️ No NISP spectrum for this object (not in spectral footprint)")
+        elif s3_data['status'] == 'download_failed':
+            status_box.error(
+                f"❌ S3 download failed: {s3_data.get('error', 'unknown')}")
+        elif s3_data['status'] == 'no_spectrum':
+            status_box.warning(
+                "⚠️ COMBSPEC file downloaded but no valid 1D data extracted from HDU")
 
-        for label, val in props.items():
-            st.markdown(f"**{label}:** `{val}`")
+        # Re-fetch button
+        cache_key = f"spectra_cache_{oid}"
+        if cache_key in st.session_state:
+            if st.button("🔄 Re-fetch spectrum from S3", key=f"refetch_{oid}"):
+                del st.session_state[cache_key]
+                st.rerun()
 
-        # VIS dropout warning
-        if obj.get('has_vis', 1) == 0:
-            st.warning("⚠️ VIS dropout — potential T dwarf or artifact")
+    # --- Display 1D spectrum ---
+    if spectrum is not None:
+        fig_raw, ax = plt.subplots(1, 1, figsize=(12, 4))
+        w = spectrum.get('wave_um', spectrum['wave'] / 10000.0)
+        ax.fill_between(w, spectrum['flux'] - spectrum['noise'],
+                        spectrum['flux'] + spectrum['noise'],
+                        alpha=0.3, color='steelblue', label='±1σ noise')
+        ax.plot(w, spectrum['flux'], 'k-', lw=0.8, label='Calibrated flux')
+        ax.set_xlabel('Wavelength (μm)', fontsize=12)
+        ax.set_ylabel('Flux', fontsize=12)
+        ax.set_title(f'1D NISP Spectrum — {oid}', fontsize=13, fontweight='bold')
+        ax.set_xlim(1.1, 2.0)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(fig_raw)
+        plt.close(fig_raw)
 
-        # Class badge
-        cls = obj.get(col_map.get('class', 'predicted_class'), 'unknown')
-        color = CLASS_COLORS.get(cls, '#777')
-        st.markdown(f'<span style="background:{color};color:white;'
-                    f'padding:4px 12px;border-radius:12px;font-weight:bold">'
-                    f'{cls.replace("_", " ")}</span>',
-                    unsafe_allow_html=True)
-
-    with spec_col:
-        # =============================================================
-        # AUTO-FETCH SPECTRUM FROM S3 (on object selection)
-        # =============================================================
-        st.markdown("#### 📈 NISP Spectrum")
-
-        # Check for pre-extracted local spectrum first
-        spectrum = None
-        oid_str = str(oid)
-        for key in [oid_str, str(int(float(oid_str))) if oid_str.replace('-','').replace('.','').isdigit() else '']:
-            if key in local_spectra:
-                spectrum = local_spectra[key]
-                break
-
-        # If no local spectrum, auto-fetch from S3
-        s3_data = None
-        if spectrum is None:
-            with st.spinner(f"🌐 Querying IRSA + downloading spectrum for {oid}..."):
-                s3_data = auto_fetch_spectra(oid)
-
-            if s3_data['status'] == 'ok' and s3_data['spectrum']:
-                spectrum = s3_data['spectrum']
-                st.success(f"✅ Spectrum from tile {s3_data['tileid']} "
-                           f"(HDU {s3_data['hdu_idx']})")
-            elif s3_data['status'] == 'no_association':
-                st.info("ℹ️ No NISP spectrum available for this object")
-            elif s3_data['status'] == 'download_failed':
-                st.error(f"❌ S3 download failed: {s3_data.get('error', 'unknown')}")
-            elif s3_data['status'] == 'no_spectrum':
-                st.warning("⚠️ COMBSPEC downloaded but no valid 1D data in HDU")
-            # Clear cache button
-            cache_key = f"spectra_cache_{oid}"
-            if cache_key in st.session_state:
-                if st.button("🔄 Re-fetch spectrum", key=f"refetch_{oid}"):
-                    del st.session_state[cache_key]
-                    st.rerun()
-
-        # --- Display 1D spectrum ---
-        if spectrum is not None:
-            fig_raw, ax = plt.subplots(1, 1, figsize=(10, 4))
-            w = spectrum.get('wave_um', spectrum['wave'] / 10000.0)
-            ax.fill_between(w, spectrum['flux'] - spectrum['noise'],
-                            spectrum['flux'] + spectrum['noise'],
-                            alpha=0.3, color='steelblue', label='±1σ')
-            ax.plot(w, spectrum['flux'], 'k-', lw=0.8, label='Flux')
-            ax.set_xlabel('Wavelength (μm)', fontsize=11)
-            ax.set_ylabel('Flux (calibrated)', fontsize=11)
-            ax.set_title(f'1D NISP Spectrum — {oid}', fontsize=12, fontweight='bold')
-            ax.set_xlim(1.1, 2.0)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.2)
-            plt.tight_layout()
-            st.pyplot(fig_raw)
-            plt.close(fig_raw)
-
-            # --- TEMPLATE FITTING ---
-            if standards is not None:
-                st.markdown("---")
-                st.markdown("#### 🔬 Template Fitting")
+        # --- TEMPLATE FITTING ---
+        if standards is not None:
+            st.markdown("---")
+            st.markdown("#### 🔬 Template Fitting")
+            fit_c1, fit_c2 = st.columns([1, 3])
+            with fit_c1:
                 try_binary = st.checkbox("Try binary composites", value=True,
                                          key=f"bin_{oid}")
                 fit_button = st.button("Run Template Fit", key=f"fit_{oid}")
-
+            with fit_c2:
                 if fit_button:
-                    progress_bar = st.progress(0)
-                    with st.spinner("Fitting against 37 templates..."):
-                        results = run_full_fit(
-                            spectrum, standards,
-                            try_binaries=try_binary,
-                            progress_callback=lambda p: progress_bar.progress(p))
+                    progress_bar = st.progress(0, text="Fitting against 37 templates...")
+                    results = run_full_fit(
+                        spectrum, standards,
+                        try_binaries=try_binary,
+                        progress_callback=lambda p: progress_bar.progress(
+                            p, text=f"Fitting... {int(p*100)}%"))
 
                     if results:
                         best = results[0]
@@ -1462,15 +1485,18 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
                     else:
                         st.error("Spectrum failed quality check (noise-dominated)")
                     progress_bar.empty()
+    else:
+        st.markdown("*No spectrum available for display.*")
 
     # =================================================================
-    # 2D GRISM SPECTROGRAM (auto-displayed if COMBSPEC was downloaded)
+    # 2D GRISM SPECTROGRAM
     # =================================================================
     st.markdown("---")
     st.markdown("#### 📸 2D Grism Spectrogram")
 
     if s3_data and s3_data.get('hdul_bytes'):
         from astropy.io import fits as afits
+        st.info("🖼️ Rendering 2D grism from downloaded COMBSPEC...")
         try:
             hdul = afits.open(io.BytesIO(s3_data['hdul_bytes']))
             hdu_idx = s3_data['hdu_idx']
@@ -1483,7 +1509,7 @@ def render_object_panel(obj, col_map, standards, local_spectra, vetting):
     elif spectrum is not None and oid_str in local_spectra:
         st.info("2D grism not available for locally pre-extracted spectra")
     elif s3_data and s3_data['status'] == 'no_association':
-        st.info("No grism data — object has no NISP spectral association")
+        st.info("No grism data — object has no NISP spectral coverage")
     else:
         st.info("No 2D grism data available")
 
