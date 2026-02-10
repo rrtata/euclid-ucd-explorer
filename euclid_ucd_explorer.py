@@ -57,7 +57,7 @@ DEFAULT_MODEL_CFG  = "ml_model_v2/model_config.json"
 S3_BUCKET   = "nasa-irsa-euclid-q1"
 S3_REGION   = "us-east-1"
 
-APP_VERSION = "1.2.1"  # bump this on each push to verify deployment
+APP_VERSION = "1.3.0"  # bump this on each push to verify deployment
 
 # IRSA base URL
 IRSA_BASE   = "https://irsa.ipac.caltech.edu"
@@ -428,18 +428,71 @@ def auto_fetch_spectra(object_id):
         st.session_state[cache_key] = result
         return result
 
-    uri = assoc.get('uri', '')
-    result['tileid'] = str(assoc.get('tileid', ''))
-    result['hdu_idx'] = int(assoc.get('hdu', 1))
+    uri = assoc.get('uri', assoc.get('file_path', assoc.get('filepath',
+          assoc.get('filename', assoc.get('access_url',
+          assoc.get('spectra_file', assoc.get('spectrafile', '')))))))
+    # Also check all string columns for COMBSPEC pattern
+    if not uri or uri == 'nan':
+        for col_name in assoc.index:
+            val = str(assoc[col_name])
+            if 'COMBSPEC' in val or '.fits' in val:
+                uri = val
+                break
+        else:
+            uri = ''
 
-    match = re.search(r'(EUC_SIR_W-COMBSPEC_\d+_[^?]+\.fits)', uri)
-    if not match or not result['tileid']:
+    # Find tileid
+    tileid = ''
+    for tname in ['tileid', 'tile_id', 'tile']:
+        if tname in assoc.index:
+            tileid = str(assoc[tname])
+            if tileid and tileid != 'nan':
+                break
+            tileid = ''
+
+    # Find HDU index
+    hdu_idx = 1
+    for hname in ['hdu', 'hdu_idx', 'hdu_index', 'ext', 'extension']:
+        if hname in assoc.index:
+            try:
+                hdu_idx = int(assoc[hname])
+                break
+            except:
+                pass
+
+    result['tileid'] = tileid
+    result['hdu_idx'] = hdu_idx
+
+    # Log what we found (first time only)
+    if 'spec_assoc_logged' not in st.session_state:
+        st.session_state.spec_assoc_logged = True
+        st.caption(f"Assoc row: {dict(assoc)}")
+
+    match = re.search(r'(EUC_SIR_W-COMBSPEC_\d+[^?\s]*\.fits)', str(uri))
+    if not match:
+        match = re.search(r'(EUC_SIR[^?\s]*\.fits)', str(uri))
+    if not match:
+        # Try to extract from any column
+        for col_name in assoc.index:
+            val = str(assoc[col_name])
+            m = re.search(r'(EUC_SIR_W-COMBSPEC_\d+[^?\s]*\.fits)', val)
+            if m:
+                match = m
+                break
+
+    if not match:
         result['status'] = 'no_association'
-        result['error'] = f"Could not parse COMBSPEC from URI: {uri[:100]}"
+        result['error'] = f"No COMBSPEC filename found. Columns: {list(assoc.index)}"
         st.session_state[cache_key] = result
         return result
 
     result['combspec'] = match.group(1)
+
+    # Extract tileid from filename if not found
+    if not tileid:
+        tm = re.search(r'COMBSPEC_(\d+)_', result['combspec'])
+        if tm:
+            result['tileid'] = tm.group(1)
 
     # Step 2: Download COMBSPEC from S3
     s3 = get_s3_client()
@@ -1001,12 +1054,31 @@ def plot_2d_grism(hdul, hdu_idx, object_id):
 # IRSA SPECTRAL ASSOCIATION QUERY
 # =====================================================================
 def query_spectral_association(object_id):
-    """Query IRSA TAP for spectral file association."""
-    # Handle float64 IDs (pandas stores big ints as float)
+    """Query IRSA TAP for spectral file association.
+    Auto-discovers column names on first call."""
     oid_int = int(float(object_id))
-    q = f"""SELECT objectid, uri, tileid, hdu
-            FROM euclid.objectid_spectrafile_association_q1
-            WHERE objectid = {oid_int}"""
+
+    # Discover columns on first call (cached in session state)
+    if 'spec_assoc_columns' not in st.session_state:
+        st.session_state.spec_assoc_columns = None
+        try:
+            from astroquery.ipac.irsa import Irsa
+            q = "SELECT TOP 1 * FROM euclid.objectid_spectrafile_association_q1"
+            r = Irsa.query_tap(q).to_table().to_pandas()
+            r.columns = [c.lower() for c in r.columns]
+            st.session_state.spec_assoc_columns = list(r.columns)
+            st.caption(f"Spec assoc columns: {list(r.columns)}")
+        except Exception as e:
+            st.caption(f"Column discovery: {e}")
+
+    # Query all columns for this object
+    cols = st.session_state.get('spec_assoc_columns')
+    if cols:
+        select_str = ', '.join(cols)
+    else:
+        select_str = '*'
+
+    q = f"SELECT {select_str} FROM euclid.objectid_spectrafile_association_q1 WHERE objectid = {oid_int}"
 
     # Try method 1: astroquery Irsa
     try:
@@ -1016,7 +1088,7 @@ def query_spectral_association(object_id):
         if len(result) > 0:
             return result.iloc[0]
     except TypeError:
-        pass  # API mismatch, try fallback
+        pass
     except Exception as e:
         st.caption(f"Irsa.query_tap: {e}")
 
@@ -1029,7 +1101,7 @@ def query_spectral_association(object_id):
         if len(result) > 0:
             return result.iloc[0]
     except ImportError:
-        pass  # pyvo not installed
+        pass
     except Exception as e:
         st.caption(f"pyvo TAP: {e}")
 
@@ -1047,9 +1119,9 @@ def query_spectral_association(object_id):
         with urllib.request.urlopen(req, timeout=30) as resp:
             import json as jmod
             data = jmod.loads(resp.read().decode())
-            cols = [c['name'].lower() for c in data['metadata']]
+            cols_resp = [c['name'].lower() for c in data['metadata']]
             if data.get('data') and len(data['data']) > 0:
-                row = dict(zip(cols, data['data'][0]))
+                row = dict(zip(cols_resp, data['data'][0]))
                 return pd.Series(row)
     except Exception as e:
         st.warning(f"IRSA TAP query failed: {e}")
